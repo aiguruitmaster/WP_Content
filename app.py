@@ -1,105 +1,172 @@
 import streamlit as st
 from supabase import create_client
+import pandas as pd
+import time
 
-# 1. Настройка страницы
-st.set_page_config(page_title="SEO Admin", layout="centered")
-st.title("🎛️ Управление SEO Фермой")
+# --- НАЛАШТУВАННЯ СТОРІНКИ ---
+st.set_page_config(
+    page_title="SEO Commander UA",
+    page_icon="🚀",
+    layout="wide"
+)
 
-# 2. Подключение к Supabase через Secrets
-# Он сам найдет их в .streamlit/secrets.toml (локально) или в облаке
+# --- ПІДКЛЮЧЕННЯ ДО SUPABASE ---
 try:
-    supabase_url = st.secrets["supabase"]["url"]
-    supabase_key = st.secrets["supabase"]["key"]
-    supabase = create_client(supabase_url, supabase_key)
+    supabase_url = st.secrets["supabase"]["url"]
+    supabase_key = st.secrets["supabase"]["key"]
+    supabase = create_client(supabase_url, supabase_key)
 except Exception as e:
-    st.error(f"Ошибка подключения к секретам: {e}")
-    st.stop()
+    st.error("❌ Помилка підключення до бази даних. Перевірте secrets.toml")
+    st.stop()
 
-# 3. Интерфейс
-tab1, tab2, tab3 = st.tabs(["➕ Добавить Сайт", "🔑 Загрузить Ключи", "👀 Просмотр Базы"])
+# --- ФУНКЦІЯ АВТОМАТИЧНОЇ СИНХРОНІЗАЦІЇ КЛЮЧІВ ---
+def sync_keys():
+    state = st.session_state["editor"]
+    sid = st.session_state["selected_site_id"]
+    df_orig = st.session_state["current_df"]
 
-# --- ВКЛАДКА 1: ДОБАВЛЕНИЕ САЙТА ---
+    # 1. Видалення з бази
+    if state["deleted_rows"]:
+        ids_to_del = df_orig.iloc[state["deleted_rows"]]["id"].tolist()
+        if ids_to_del:
+            supabase.table("keywords").delete().in_("id", ids_to_del).execute()
+
+    # 2. Редагування існуючих
+    if state["edited_rows"]:
+        for idx, changes in state["edited_rows"].items():
+            row_id = df_orig.iloc[int(idx)]["id"]
+            supabase.table("keywords").update(changes).eq("id", row_id).execute()
+
+    # 3. Додавання нових
+    if state["added_rows"]:
+        for row in state["added_rows"]:
+            row["site_id"] = sid
+            if "status" not in row: row["status"] = "new"
+            supabase.table("keywords").insert(row).execute()
+
+st.title("🎛️ Панель Управління SEO Фермою (UA)")
+
+tab1, tab2, tab3 = st.tabs(["➕ Додати Проект", "📊 Дашборд", "⚙️ Керування Ключами та URL"])
+
+# ==========================================
+# ВКЛАДКА 1: ДОДАВАННЯ (З ПОЛЕМ ПАРОЛЯ)
+# ==========================================
 with tab1:
-    st.header("Подключение нового сайта")
-    with st.form("add_site_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            domain = st.text_input("Домен (для удобства)", placeholder="mysite.com")
-            username = st.text_input("Login (WordPress)")
-        with col2:
-            api_url = st.text_input("API URL", placeholder="https://mysite.com")
-            app_password = st.text_input("App Password", type="password", help="Пароль приложения, не от админки!")
-        
-        interval = st.number_input("Интервал постинга (часов)", min_value=1, value=12)
-        
-        submitted = st.form_submit_button("Сохранить сайт")
-        
-        if submitted:
-            if not domain or not api_url or not username or not app_password:
-                st.warning("Заполните все поля!")
-            else:
-                # Убираем слэш в конце URL если есть
-                clean_url = api_url.rstrip("/")
-                data = {
-                    "domain": domain,
-                    "api_url": clean_url,
-                    "username": username,
-                    "app_password": app_password,
-                    "posting_interval": interval
-                }
-                try:
-                    supabase.table("sites").insert(data).execute()
-                    st.success(f"Сайт {domain} успешно добавлен в базу!")
-                except Exception as e:
-                    st.error(f"Ошибка записи в БД: {e}")
+    st.header("Налаштування нового сайту")
+    with st.form("main_add_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            site_link = st.text_input("Посилання (URL)", placeholder="https://vash-sait.com.ua")
+            login = st.text_input("Логін (WP Admin)")
+            password = st.text_input("Звичайний пароль (для нотаток)", type="password")
+            app_password = st.text_input("App Password (для API)", type="password")
+        
+        with col2:
+            lang = st.selectbox("Мова", ["ua", "en", "de", "pl"])
+            interval = st.number_input("Інтервал (годин)", min_value=1, value=12)
+            keywords_text = st.text_area("Список тем (ключі)", height=150)
 
-# --- ВКЛАДКА 2: ЗАГРУЗКА КЛЮЧЕЙ ---
+        if st.form_submit_button("🚀 Зберегти проект"):
+            if site_link and login and app_password:
+                clean_link = site_link.strip().rstrip("/")
+                try:
+                    res = supabase.table("sites").insert({
+                        "site_link": clean_link, "login": login, "password": password,
+                        "app_password": app_password, "lang": lang,
+                        "posting_interval": interval, "is_active": True
+                    }).execute()
+                    
+                    if res.data and keywords_text.strip():
+                        sid = res.data[0]['id']
+                        lines = [l.strip() for l in keywords_text.split('\n') if l.strip()]
+                        payload = [{"site_id": sid, "keyword": k, "status": "new"} for k in lines]
+                        supabase.table("keywords").insert(payload).execute()
+                    st.success("✅ Проект додано!")
+                    time.sleep(1); st.rerun()
+                except Exception as e: st.error(f"Помилка: {e}")
+
+# ==========================================
+# ВКЛАДКА 2: ДАШБОРД (З ПОСИЛАННЯМИ НА СТАТТІ)
+# ==========================================
 with tab2:
-    st.header("Массовая загрузка задач")
-    
-    # Сначала получаем список доступных сайтов из базы
-    try:
-        response = supabase.table("sites").select("id, domain").execute()
-        sites = response.data
-    except:
-        sites = []
+    st.header("📊 Стан публікацій")
+    try:
+        sites_data = supabase.table("sites").select("*").execute().data
+        # Завантажуємо ключі разом із посиланнями на статті
+        keys_data = supabase.table("keywords").select("site_id, keyword, status, article_link, created_at").execute().data
+        
+        if sites_data:
+            df_keys_all = pd.DataFrame(keys_data) if keys_data else pd.DataFrame()
+            
+            for s in sites_data:
+                with st.expander(f"🌐 {s['site_link']} — {s['lang'].upper()}", expanded=True):
+                    sk = df_keys_all[df_keys_all['site_id'] == s['id']] if not df_keys_all.empty else pd.DataFrame()
+                    
+                    # Метрики
+                    c1, c2, c3 = st.columns(3)
+                    total = len(sk); done = len(sk[sk['status'].isin(['published', 'done'])])
+                    c1.metric("Усього тем", total)
+                    c2.metric("Готово", done)
+                    c3.metric("В черзі", total - done)
+                    
+                    if total > 0: st.progress(done / total)
 
-    if not sites:
-        st.warning("Сначала добавьте хотя бы один сайт во вкладке 1.")
-    else:
-        # Создаем словарь {domain: id} для удобства
-        site_map = {site['domain']: site['id'] for site in sites}
-        selected_domain = st.selectbox("Для какого сайта грузим ключи?", list(site_map.keys()))
-        
-        # Поле ввода
-        keywords_text = st.text_area("Список тем (каждая тема с новой строки)", height=300)
-        
-        if st.button("🚀 Загрузить в очередь"):
-            if not keywords_text.strip():
-                st.warning("Список пуст.")
-            else:
-                site_id = site_map[selected_domain]
-                # Разбиваем текст на строки и чистим от пробелов
-                lines = [line.strip() for line in keywords_text.split('\n') if line.strip()]
-                
-                # Формируем данные для отправки
-                payload = [{"site_id": site_id, "keyword": k, "status": "new"} for k in lines]
-                
-                try:
-                    supabase.table("keywords").insert(payload).execute()
-                    st.success(f"Успешно добавлено {len(payload)} задач для {selected_domain}!")
-                except Exception as e:
-                    st.error(f"Ошибка записи: {e}")
+                    # ТАБЛИЦЯ ПОСИЛАНЬ (як у початковій версії)
+                    if not sk.empty:
+                        st.subheader("🔗 Останні опубліковані посилання")
+                        # Фільтруємо лише готові для виводу посилань
+                        done_links = sk[sk['status'].isin(['published', 'done'])].sort_values(by="created_at", ascending=False)
+                        if not done_links.empty:
+                            st.dataframe(
+                                done_links[["keyword", "article_link", "created_at"]],
+                                column_config={"article_link": st.column_config.LinkColumn("Посилання на пост")},
+                                use_container_width=True, hide_index=True
+                            )
+                        else: st.info("Публікацій ще немає.")
+        else: st.info("Додайте сайт.")
+    except Exception as e: st.error(f"Помилка: {e}")
 
-# --- ВКЛАДКА 3: ПРОСМОТР (ДЛЯ ТЕСТА) ---
+# ==========================================
+# ВКЛАДКА 3: КЕРУВАННЯ (АВТО-СИНХРОНІЗАЦІЯ)
+# ==========================================
 with tab3:
-    st.subheader("Статистика очереди")
-    if st.button("Обновить данные"):
-        st.rerun()
-        
-    # Получаем сырые данные (первые 100)
-    try:
-        data = supabase.table("keywords").select("keyword, status, created_at").order("created_at", desc=True).limit(20).execute()
-        st.dataframe(data.data)
-    except Exception as e:
-        st.error(e)
+    st.header("⚙️ Редагування бази")
+    all_sites = supabase.table("sites").select("id, site_link").execute().data
+    if all_sites:
+        site_map = {s['site_link']: s['id'] for s in all_sites}
+        sel_name = st.selectbox("Виберіть сайт", options=list(site_map.keys()))
+        sid = site_map[sel_name]
+        st.session_state["selected_site_id"] = sid
+        
+        # Видалення сайту
+        with st.expander("🗑️ Небезпечна зона (Видалення проекту)"):
+            if st.button(f"Видалити {sel_name} та всі ключі", type="primary"):
+                supabase.table("keywords").delete().eq("site_id", sid).execute()
+                supabase.table("sites").delete().eq("id", sid).execute()
+                st.rerun()
+
+        st.divider()
+        st.subheader("🔑 Керування ключами та посиланнями")
+        st.caption("Змінюйте текст, статус або посилання прямо в таблиці — збережеться автоматично.")
+        
+        db_keys = supabase.table("keywords").select("*").eq("site_id", sid).order("id").execute().data
+        if db_keys:
+            df_keys = pd.DataFrame(db_keys)
+            st.session_state["current_df"] = df_keys
+            st.data_editor(
+                df_keys,
+                column_config={
+                    "id": None, "site_id": None, "created_at": None,
+                    "keyword": st.column_config.TextColumn("Ключове слово", width="large"),
+                    "status": st.column_config.SelectboxColumn("Статус", options=["new", "published", "error"]),
+                    "article_link": st.column_config.TextColumn("URL статті (можна редагувати)")
+                },
+                num_rows="dynamic", use_container_width=True, key="editor", on_change=sync_keys
+            )
+    else: st.warning("Додайте сайт.") 
+
+
+привет у меня есть вот такой вот код но внем есть ошибка которую я не могу решить 
+суть в том когда я нажимаю на табличку обновить или добавить слово и вот что выскакивает 
+
+как мне ее решить 
