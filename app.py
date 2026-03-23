@@ -19,6 +19,39 @@ except Exception as e:
     st.error("❌ Помилка підключення до бази даних. Перевірте secrets.toml")
     st.stop()
 
+# --- ФУНКЦІЯ ПАГІНАЦІЇ ДЛЯ ОБХОДУ ЛІМІТУ 1000 СТРОК ---
+def fetch_all_data(table_name, select_query="*", eq_column=None, eq_value=None, order_by=None):
+    """Витягує всі дані з таблиці, обходячи обмеження API."""
+    all_data = []
+    limit = 1000
+    offset = 0
+    
+    while True:
+        query = supabase.table(table_name).select(select_query)
+        
+        if eq_column and eq_value is not None:
+            query = query.eq(eq_column, eq_value)
+            
+        if order_by:
+            query = query.order(order_by)
+            
+        # Запитуємо діапазон (в Supabase range включний: 0-999, 1000-1999 тощо)
+        response = query.range(offset, offset + limit - 1).execute()
+        data = response.data
+        
+        if not data:
+            break
+            
+        all_data.extend(data)
+        
+        # Якщо повернулося менше ліміту, значить це остання "сторінка"
+        if len(data) < limit:
+            break
+            
+        offset += limit
+        
+    return all_data
+
 # --- ФУНКЦІЯ АВТОМАТИЧНОЇ СИНХРОНІЗАЦІЇ КЛЮЧІВ ---
 def sync_keys():
     state = st.session_state["editor"]
@@ -45,8 +78,8 @@ def sync_keys():
 
     # 3. Додавання нових (З ПЕРЕВІРКОЮ НА УНІКАЛЬНІСТЬ)
     if state["added_rows"]:
-        # Отримуємо існуючі ключі для цього сайту, щоб уникнути дублів
-        existing_data = supabase.table("keywords").select("keyword").eq("site_id", sid).execute().data
+        # Отримуємо існуючі ключі через пагінацію
+        existing_data = fetch_all_data("keywords", select_query="keyword", eq_column="site_id", eq_value=sid)
         existing_keys = set([x["keyword"].strip().lower() for x in existing_data])
 
         for row in state["added_rows"]:
@@ -59,12 +92,12 @@ def sync_keys():
                     row.pop("created_at", None)
                     
                     row["site_id"] = sid
-                    row["keyword"] = kw_clean # Зберігаємо очищений від пробілів ключ
+                    row["keyword"] = kw_clean
                     if "status" not in row or not row["status"]: 
                         row["status"] = "new"
                     
                     supabase.table("keywords").insert(row).execute()
-                    existing_keys.add(kw_clean.lower()) # Додаємо до списку, щоб не додати дубль у цьому ж циклі
+                    existing_keys.add(kw_clean.lower())
 
 st.title("🎛️ Панель Управління SEO Фермою (UA)")
 
@@ -84,7 +117,6 @@ with tab1:
             app_password = st.text_input("App Password (для API)", type="password")
         
         with col2:
-            # Змінили selectbox на text_input для вільного вводу мови
             lang = st.text_input("Мова сайту", placeholder="Наприклад: ua, en, es, de")
             interval = st.number_input("Інтервал (годин)", min_value=1, value=12)
             keywords_text = st.text_area("Список тем (ключі, кожна з нового рядка)", height=150)
@@ -101,11 +133,11 @@ with tab1:
                     
                     if res.data and keywords_text.strip():
                         sid = res.data[0]['id']
-                        # Очищаємо та прибираємо дублі за допомогою set()
                         lines = [l.strip() for l in keywords_text.split('\n') if l.strip()]
                         unique_lines = list(set(lines)) 
                         
                         payload = [{"site_id": sid, "keyword": k, "status": "new"} for k in unique_lines]
+                        # Вставка пачкою (якщо ключів більше 1000, можна теж розбити на чанки, але зазвичай з форми стільки не кидають)
                         supabase.table("keywords").insert(payload).execute()
                         
                     st.success("✅ Проект успішно додано!")
@@ -123,7 +155,8 @@ with tab2:
     st.header("📊 Стан публікацій")
     try:
         sites_data = supabase.table("sites").select("*").execute().data
-        keys_data = supabase.table("keywords").select("site_id, keyword, status, article_link, created_at").execute().data
+        # Використовуємо пагінацію для всіх ключів
+        keys_data = fetch_all_data("keywords", select_query="site_id, keyword, status, article_link, created_at")
         
         if sites_data:
             df_keys_all = pd.DataFrame(keys_data) if keys_data else pd.DataFrame()
@@ -173,29 +206,31 @@ with tab3:
         # --- БЛОК ІМПОРТУ З EXCEL ---
         st.divider()
         st.subheader("📥 Масовий імпорт ключів (Excel)")
-        st.caption("Завантажте файл .xlsx. Ключі мають бути у першій колонці (кожен рядок = новий ключ). Дублікати будуть проігноровані.")
+        st.caption("Завантажте файл .xlsx. Ключі мають бути у першій колонці. Дублікати будуть проігноровані.")
         
         uploaded_file = st.file_uploader("Виберіть файл", type=["xlsx"])
         if uploaded_file is not None:
             if st.button("Завантажити ключі в базу"):
                 try:
-                    # Читаємо Excel, перша колонка (без заголовка)
                     df_excel = pd.read_excel(uploaded_file, header=None)
-                    # Беремо першу колонку, перетворюємо в текст, видаляємо NaN та пробіли
                     new_keys = df_excel.iloc[:, 0].dropna().astype(str).str.strip().tolist()
-                    new_keys = [k for k in new_keys if k] # Видаляємо порожні рядки
+                    new_keys = [k for k in new_keys if k]
                     
                     if new_keys:
-                        # Запитуємо існуючі ключі з бази
-                        existing_data = supabase.table("keywords").select("keyword").eq("site_id", sid).execute().data
+                        # Запитуємо існуючі ключі через пагінацію
+                        existing_data = fetch_all_data("keywords", select_query="keyword", eq_column="site_id", eq_value=sid)
                         existing_keys = set([x["keyword"].lower() for x in existing_data])
                         
-                        # Фільтруємо: беремо тільки ті, яких ще немає
                         keys_to_add = list(set([k for k in new_keys if k.lower() not in existing_keys]))
                         
                         if keys_to_add:
-                            payload = [{"site_id": sid, "keyword": k, "status": "new"} for k in keys_to_add]
-                            supabase.table("keywords").insert(payload).execute()
+                            # Якщо ключів дуже багато, краще розбити їх на батчі (шматки по 1000) для вставки
+                            batch_size = 1000
+                            for i in range(0, len(keys_to_add), batch_size):
+                                batch = keys_to_add[i:i + batch_size]
+                                payload = [{"site_id": sid, "keyword": k, "status": "new"} for k in batch]
+                                supabase.table("keywords").insert(payload).execute()
+
                             st.success(f"✅ Успішно додано {len(keys_to_add)} нових унікальних ключів!")
                             time.sleep(1.5)
                             st.rerun()
@@ -219,7 +254,9 @@ with tab3:
                     supabase.table("sites").delete().eq("id", sid).execute()
                     st.rerun()
         
-        db_keys = supabase.table("keywords").select("*").eq("site_id", sid).order("id").execute().data
+        # Витягуємо всі ключі для таблиці через пагінацію
+        db_keys = fetch_all_data("keywords", select_query="*", eq_column="site_id", eq_value=sid, order_by="id")
+        
         if db_keys:
             df_keys = pd.DataFrame(db_keys)
             st.session_state["current_df"] = df_keys
